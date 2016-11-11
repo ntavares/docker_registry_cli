@@ -1,9 +1,80 @@
 import json
 import requests
 import sys
+import urllib
+from requests.auth import HTTPBasicAuth
+from base64 import b64decode
+
+from ecdsa import SigningKey, SECP256k1
 
 ''' Disable Warnings when using verify=False'''
 '''requests.packages.urllib3.disable_warnings()'''
+def debug(text):
+    print "[D] " + str(text)
+
+def get_registry_auth_token(wwwauth_header, username=None, password=None, ssl=False):
+    debug("get_registry_auth_token(%s)" % wwwauth_header)
+    token=None
+    
+    import re
+    pattern = 'Bearer realm="(?P<url>.*?)",service="(?P<service>.*?)",scope="(?P<scope>.*?)"'
+    m = re.match(pattern, wwwauth_header)
+    
+    if m:
+        #debug("RESULT=%s" % str(m.groups()))
+
+        a = requests.Session()
+        #debug( str(" + username=%s, password=%s" % (username, password)) )
+        a.auth = HTTPBasicAuth(username, password)
+        url = m.group('url') + '?service=' + urllib.quote_plus(m.group('service')) + '&scope=' + m.group('scope')
+        req = a.get(url, verify=False)
+
+        #debug('AUTH request: %s' % url)
+        #debug('AUTH response: %s' % req.text)
+        if (req):
+            parsed_json = json.loads(req.text)
+            token = parsed_json['token']
+            #debug('AUTH success, token=%s' % token)
+
+    return token
+
+
+
+# Refer to: 
+# * https://docs.docker.com/registry/spec/auth/token/
+# * https://docs.docker.com/registry/spec/auth/jwt/
+# * docker_auth/auth_server/server.go:CreateToken()
+def rehash_registry_auth_token(strtoken):
+    authtoken = None
+    
+    token_parts = strtoken.split('.')
+    
+    #debug('token.part-1: %s' % token_parts[0])
+    #debug('token.part-2: %s' % token_parts[1])
+
+    joseHdr = json.loads(b64decode(token_parts[0] + '='))
+    claimSet = json.loads(b64decode(token_parts[1] + '='))
+    
+    debug(' + joseHdr: %s' % joseHdr)
+    debug(' + claimSet: %s' % claimSet)
+    
+    ecdsa_key = { 'kty': 'EC', 'crv': 'P-256', 'kid': joseHdr['kid'] }
+    ecdsa_key = {
+    "kty": "EC",
+    "crv": "P-256",
+    "kid": "PYYO:TEWU:V7JH:26JV:AQTZ:LJC3:SXVJ:XGHA:34F2:2LAQ:ZRMK:Z7Q6",
+    "d": "R7OnbfMaD5J2jl7GeE8ESo7CnHSBm_1N2k9IXYFrKJA",
+    "x": "m7zUpx3b-zmVE5cymSs64POG9QcyEpJaYCD82-549_Q",
+    "y": "dU3biz8sZ_8GPB-odm8Wxz3lNDr1xcAQQPQaOcr1fmc"
+}
+
+    sk = SigningKey.from_string( ecdsa_key['kid'], curve=SECP256k1)
+   
+    debug(sk)    
+    
+    return authtoken
+
+
 
 def get_reqistry_request(url, username=None, password=None, ssl=False):
 
@@ -23,6 +94,15 @@ def get_reqistry_request(url, username=None, password=None, ssl=False):
 
 	try:
 		req = s.get(url_endpoint, verify=False)
+		if('Www-Authenticate' in req.headers):
+			debug("WARNING: Request for auth")
+			token = get_registry_auth_token(req.headers['Www-Authenticate'], username, password, ssl)
+			if(token):
+				token = rehash_registry_auth_token(token)
+                
+				s.headers.update({'Authorization': 'Bearer ' + token})
+				req = s.get(url_endpoint, verify=False)
+				debug("FINAL: %s" % req.text)
 	except requests.ConnectionError:
 		print 'Cannot connect to Registry'	
 
@@ -62,16 +142,19 @@ def extract_url(url):
 
 	uname_pwd_delimeter=":"
 	auth_ip_delimeter="@"
-	
-	if url.find(auth_ip_delimeter)==-1:
+	position_ip_delimeter=url.find(auth_ip_delimeter)
+
+	if position_ip_delimeter==-1:
 		return None, None, url
 	else:
 		delimiter_uname_pwd_pos = url.find(uname_pwd_delimeter)
+        
 		delimeter_auth_ip_pos = url.find(auth_ip_delimeter, delimiter_uname_pwd_pos)
 		username = url[:delimiter_uname_pwd_pos]
 		password = url[delimiter_uname_pwd_pos+1:delimeter_auth_ip_pos]
 		url_endpoint = url[delimeter_auth_ip_pos+1:]
-
+		#debug('url_endpoint=%s, username=%s, password=%s' % (url_endpoint, username, password))
+		debug('url_endpoint=%s, username=%s, password=****' % (url_endpoint, username))
 		return username, password, url_endpoint
 
 
@@ -86,6 +169,9 @@ def get_all_repos(url, ssl=False):
 
 	if(req!=None):
 		parsed_json = json.loads(req.text)
+	if(('errors' in parsed_json) and ('code' in parsed_json['errors'][0])):
+		print "ERROR: %s" % parsed_json['errors'][0]['message']
+		return []
 	if('repositories' in parsed_json):
 		repo_array = parsed_json['repositories']
 
